@@ -1,6 +1,6 @@
 ---
-title: "my title"
-author: "Dummy Surname (dummy@mail.com)"
+title: "Assignment 1 Exploratory Data Analysis"
+author: "Xavier Vílchez (xavier.vilchez01@estudiant.upf.edu)"
 date: "Last update: `r format(Sys.time(), '%d %B, %Y')`"      
 output:
   html_document:
@@ -20,43 +20,732 @@ The original dataset comes from [here](https://archive.ics.uci.edu/ml/datasets/H
 
 ## Perform an EDA on the dataset
 
-```{r}
-
-
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+# Load necessary libraries
+library(mice)
+library(GGally)
+library(DataExplorer)
+library(SmartEDA)
+library(vtable)
+library(mlbench)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(reshape2)
+library(ggpubr)
+library(rcompanion)
+library(corrplot)
+library(readxl)
+library(gridExtra)
+library(grid)
+library(ggplotify)
+library(patchwork)
+library(naniar)
+library(ComplexHeatmap)
+library(circlize)
+library(tibble)
+library(viridis)
 
 ```
 
+```{r}
+# Load the dataset
+data <- read.table("./data/raw_data/heart_disease_dataset.csv", na.strings = "?", header = TRUE)
+
+# Convert appropriate columns to factors for categorical variables
+factor_columns <- c("sex", "cp", "fbs", "restecg", "exang", "slope", "ca", "thal", "num")
+data[factor_columns] <- lapply(data[factor_columns], as.factor)
+
+# 1. Data summary reports
+# Generate summaries using vtable
+vtable(data)
+
+#Check the quality of the data
+plot_intro(data)
+
+# 2. Check for missing values
+# Visualize missing data
+plot_missing(data)
+```
+
+The dataset contains clinical data from 303 patients with 15 variables related to heart disease or health. 
+
+As we can see, we have almost no NAs in the dataset, but we will try to impute them using the Mice package.
+
+```{r}
+# Handle missing values using mice
+if (anyNA(data)) {
+  invisible(capture.output({
+      mice_output <- mice(data, m = 1, method = 'pmm', seed = 1)
+  data_imputed <- complete(mice_output, 1) # Use the first imputed dataset
+    }))
+}
+
+# Check if it's okay
+plot_missing(data_imputed)
+```
+
+
+The imputation process has been successful, now we will tackle the outlier detection.
+
+
+```{r}
+# Identify numerical columns, ignoring the ID column
+numerical_columns <- setdiff(names(data_imputed), c("patient_id", factor_columns))
+
+# Update the 'sex' variable to use "Male" and "Female" instead of 1 and 0
+data_imputed$sex <- factor(data_imputed$sex, levels = c(0, 1), labels = c("Female", "Male"))
+
+# 3. Outliers detection and replacement
+
+# Detect and replace outliers
+data_cleaned <- data_imputed
+replace_outliers <- function(column_name) {
+  column <- data_cleaned[[column_name]]
+  if (is.numeric(column)) {
+    Q1 <- quantile(column, 0.25)
+    Q3 <- quantile(column, 0.75)
+    IQR <- Q3 - Q1 
+    upper_limit <- Q3 + 1.5 * IQR 
+    lower_limit <- Q1 - 1.5 * IQR 
+    data_cleaned[[column_name]] <<- ifelse(column > upper_limit, upper_limit, ifelse(column < lower_limit, lower_limit, column))
+  }
+}
+
+# Box plots for numerical variables
+# Apply the function to the numerical columns
+invisible(lapply(numerical_columns, replace_outliers))
+
+# Function to create comparison box plots before and after outliers replacement 
+create_comparison_boxplots <-function(data_before, data_after, numerical_columns) {
+  #Create a list to store all plots 
+  plot_list <- list()
+  
+  for (col in numerical_columns) {
+    # Prepare data for plotting 
+    df_combined <- data.frame(
+      value = c(data_before[[col]], data_after[[col]]), 
+      group = factor(rep(c("Before", "After"), each = nrow(data_before)), 
+                     levels = c("Before", "After")),
+      variable = col
+    )
+    # Create plot
+    p <- ggplot(df_combined, aes(x = group, y = value, fill = group, color = group)) +
+      # Add boxplot
+      geom_boxplot(alpha = 0.5, outlier.shape = NA) +
+      # Add jittered points 
+      geom_jitter(width = 0.2, alpha = 0.3) +
+      # Set colors 
+      scale_fill_manual(values = c("Before" = "purple", "After" = "darkblue")) +
+      scale_color_manual(values = c("Before" = "purple", "After" = "darkblue")) +
+      # Customize theme 
+      theme_minimal() +
+      theme(
+        plot.title = element_text(size = 12, face = "bold"), 
+        axis.title.x = element_blank(),
+        panel.grid.major.x = element_blank()
+      ) +
+      # Add labels 
+      labs(title = paste("Distribution of", col), y = col) + xlab(col)
+    plot_list[[col]] <- p
+  }
+  return(plot_list)
+}
+
+#Create all plots 
+plots <- create_comparison_boxplots(data_imputed, data_cleaned, numerical_columns)
+plots 
+```
+
+
+As you can see in the boxplots, the outliers have been replaced by values 3SD from the mean. Now that we have a clean dataset, we can create a file for future use.
+
+```{r}
+# Save the processed and imputed dataset
+write.csv(data_cleaned, "./data/processed_data/heart_disease_dataset_cleaned.csv", row.names = FALSE)
+```
+
+
+With the clean dataset, we can now perform an EDA, starting with the univariate analysis for continuous and categorical variables.
+
+```{r}
+# 4. Univariate summaries
+
+summary(data_cleaned[numerical_columns])
+
+# Function to create a combined frequency table for all categorical variables 
+create_combined_freq_table <- function(data, factor_columns) {
+  # Initialize an empty data frame to store all results 
+  all_frequencies <- list()
+  
+  # Process each factor column in order 
+  for (col in factor_columns) {
+    # Calculate frequencies 
+    freq <- table(data[[col]])
+    rel_freq <- prop.table(freq) * 100
+    
+    #Create data frame for this variable 
+    freq_df <- data.frame(
+      Variable = col, 
+      Category = names(freq), 
+      Frequency = as.numeric(freq), 
+      Percentage = round(as.numeric(rel_freq), 2)
+    )
+    # Append to the main data frame 
+    all_frequencies[[col]] <- freq_df
+  }
+  all_frequencies <- do.call(rbind, all_frequencies)
+  
+  # Create nice looking table with kableExtra
+  kable(all_frequencies, 
+        format = "html", 
+        caption = "Frequency distribution of categorical variables") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
+}
+
+# Create and display the combined frequency table 
+combined_freq_table <- create_combined_freq_table(data_cleaned, factor_columns)
+combined_freq_table
+
+# Plot univariate distributions
+plot_bar(data_cleaned[factor_columns], title = "Bar Plots for Categorical Variables")
+
+plot_histogram(data[ , numerical_columns], title = "Histograms for Numerical Variables")
+```
+
+
+From the barplots we can see that the sex ratio is imbalanced in this study, as for the rest of the variables, we see that most of the patients have low levels of the possible biomarkers for having heart disease and that they actually doesn't show any symptoms related with heart disease (represented by the increase in the factor num).
+
+From the histograms we can see that the age follows approximately a normal distribution with mean 54 years old (younger people typically don't have this kind of disease). Chol, oldpeak and trestbps have left-skewed distributions, whereas thalach follows a right-skewed distribution. However, the median of the Chol variable is at 241, which by the medical standards is considered high.
+
+Now, we will proceed with the bivariate analysis.
+
+```{r, warning=FALSE}
+# 5. Bivariate analysis
+# Pairwise scatter plots and correlation for numerical variables
+ggpairs(data_cleaned, columns = c("age", "trestbps", "chol", "thalach", "oldpeak"))
+
+# Function to compute Cramér's V
+cramers_v <- function(x, y) {
+  tbl <- table(x, y)
+  chisq <- chisq.test(tbl)
+  n <- sum(tbl)
+  phi2 <- chisq$statistic / n
+  k <- min(ncol(tbl), nrow(tbl))
+  return(sqrt(phi2 / (k - 1)))
+}
+
+# Compute Cramér's V for all categorical variable pairs
+factor_vars <- factor_columns[factor_columns != "num"]
+cramers_matrix <- matrix(NA, nrow = length(factor_vars), ncol = length(factor_vars),
+                         dimnames = list(factor_vars, factor_vars))
+
+for (i in 1:length(factor_vars)) {
+  for (j in 1:length(factor_vars)) {
+    if (i != j) {
+      cramers_matrix[i, j] <- cramers_v(data_cleaned[[factor_vars[i]]], data_cleaned[[factor_vars[j]]])
+    } else {
+      cramers_matrix[i, j] <- NA  # Hide diagonal
+    }
+  }
+}
+
+# Convert to long format for ggplot
+cramers_df <- melt(cramers_matrix, na.rm = TRUE)  # Remove NA values (diagonal)
+
+# Plot heatmap without diagonal
+ggplot(cramers_df, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "red", na.value = "white") +
+  labs(title = "Association Between Categorical Variables (Cramér's V)",
+       x = "Variable 1", y = "Variable 2", fill = "Cramér's V") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+From the bivariate continuous analysis, we can see that age has significant correlation with all the other variables. 
+
+As for the categorical variables, we have used Cramer's V test to see which variables are more related to each other, and we can see that the most related pairs are sex-thal and exang-cp.
 
 ## Create visualizations in order to show which variables seem to be more associated with heart disease
 
-```{r}
+```{r, warning=FALSE}
+# 7. Association between variables and heart disease
+# Chi-squared test and filtering significant variables
+significant_categorical_vars <- c()
 
+for (col in setdiff(factor_columns, "num")) {
+  chisq_test <- chisq.test(table(data_cleaned[[col]], data_cleaned$num))
+  p_value <- chisq_test$p.value
+  
+  if (p_value < 0.05) {
+    significant_categorical_vars <- c(significant_categorical_vars, col)
+  }
+}
+
+# Ensure 'num' is a factor for proper grouping
+data_cleaned$num <- as.factor(data_cleaned$num)
+
+# Plot only significant categorical variables
+for (col in significant_categorical_vars) {
+  p <- ggplot(data_cleaned, aes(x = !!sym(col), fill = num)) +
+    geom_bar(position = "fill") +
+    labs(title = paste("Proportion of Heart Disease by", col),
+         x = col, y = "Proportion") +
+    theme_minimal() +
+    scale_fill_brewer(palette = "Set3")
+  print(p)
+}
 ```
 
 
+The plots from the significant Chi-squared results indicate that all the significant categorical variables associated with num (which is the factor describing the severity of the heart disease) show a positive linear correlation with num.
+
+```{r}
+# Calculate correlations and their p-values for numerical variables vs. heart disease
+
+correlation_results <- data.frame(Variable = character(), Correlation = numeric(), P_Value = numeric())
+
+for (col in numerical_columns) {
+  if (is.numeric(data_cleaned[[col]])) {
+    cor_test <- cor.test(data_cleaned[[col]], as.numeric(data_cleaned$num), method = "spearman", exact = FALSE)
+    correlation_results <- rbind(correlation_results,
+                                  data.frame(Variable = col,
+                                             Correlation = cor_test$estimate,
+                                             P_Value = cor_test$p.value))
+  }
+}
+
+
+# Visualize the correlation coefficients and their significance
+ggplot(correlation_results, aes(x = reorder(Variable, Correlation), y = Correlation, fill = P_Value < 0.05)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("red", "green"), labels = c("Not Significant", "Significant")) +
+  labs(title = "Correlation of Numerical Variables with Heart Disease",
+       x = "Numerical Variable",
+       y = "Spearman Correlation Coefficient") +
+  coord_flip() +
+  theme_minimal()
+
+# Store correlation results in a dataframe efficiently
+correlation_results <- data.frame(Variable = character(), Correlation = numeric(), P_Value = numeric())
+
+for (col in numerical_columns) {
+  if (is.numeric(data_cleaned[[col]])) {
+    cor_test <- cor.test(data_cleaned[[col]], as.numeric(data_cleaned$num), method = "spearman", exact = FALSE)
+    correlation_results <- rbind(correlation_results,
+                                  data.frame(Variable = col,
+                                             Correlation = cor_test$estimate,
+                                             P_Value = cor_test$p.value))
+  }
+}
+
+# Filter only significant variables (p < 0.05)
+significant_vars <- correlation_results %>%
+  filter(P_Value < 0.05) %>%
+  pull(Variable)
+
+# Ensure heart disease variable "num" is included
+significant_vars <- c(significant_vars, "num")
+
+# Ensure 'num' is numeric
+data_cleaned$num <- as.numeric(as.character(data_cleaned$num)) 
+
+# Compute correlation matrix only for significant numerical variables
+cor_matrix_filtered <- cor(data_cleaned[significant_vars], method = "spearman", use = "pairwise.complete.obs")
+
+# Visualize the filtered correlation matrix
+corrplot(cor_matrix_filtered, method = "color", type = "upper", 
+         tl.col = "black", tl.srt = 45, # Rotate labels for better readability
+         addCoef.col = "black", # Show correlation coefficient values
+         diag = FALSE) # Hide diagonal (correlation of variables with themselves)
+```
+
+
+As for the continuous variables, the correlation matrix obtained with the significant Spearman's correlation results shows that oldpeak is the most positively associated variable with num, and that a increase in the thalach variable decreases the severity of the disease.
+
 # 2 Difference in mortality rates in hospitalized COVID-19 patients 
-Using the supplementary material from the [Difference in mortality rates in hospitalized COVID-19 patients identified by cytokine profile clustering using a machine learning approach: An outcome prediction alternative](https://www.frontiersin.org/articles/10.3389/fmed.2022.987182/full), perform the following tasks
+*Using the supplementary material from the [Difference in mortality rates in hospitalized COVID-19 patients identified by cytokine profile clustering using a machine learning approach: An outcome prediction alternative](https://www.frontiersin.org/articles/10.3389/fmed.2022.987182/full), perform the following tasks*
 
 ## Reproduce Figure 1 from the publication
 
+```{r, message=FALSE, warning=FALSE}
+# Load the datasets
+file1 <- "./data/raw_data/Table_1_COVID-19.XLSX"
+
+data1 <- read_excel(file1)
+
+# Replace the headers of data1 with the first row
+colnames(data1) <- data1[1, ]  # Set the first row as column names
+data1 <- data1[-1, ]           # Remove the first row
+
+# Replace "NI" and "ND" with NA in all columns of data1
+data1[data1 == "NI" | data1 == "ND"] <- NA
+
+# Remove exact duplicates
+data1 <- data1 %>%
+  distinct()
+
+# Remove duplicated IDs with different data
+data1 <- data1 %>%
+  group_by(ID) %>%
+  filter(n() == 1) %>%
+  ungroup()
+
+# Remove rows with the Death value being different than Yes or No
+data1 <- data1 %>%
+  filter(!is.numeric(as.numeric(Death)) | Death %in% c("Yes", "No"))
+
+# Iterate over each row to apply the conditions
+data1$`ARDS Diagnosis` <- ifelse(
+  !(data1$`ARDS Diagnosis` %in% c("Yes", "No")),  # Check if ARDS Diagnosis is not "Yes" or "No"
+  ifelse(data1$`Days with ARDS` == 0, "No", "Yes"),  # If Use of ARDS is 0, set Diagnosis to "No", else "Yes"
+  data1$`ARDS Diagnosis`  # Keep the existing value if ARDS Diagnosis is already "Yes" or "No"
+)
+
+data1$`Use of NIV` <- ifelse(
+  !(data1$`Use of NIV` %in% c("Yes", "No")),  # Check if ARDS Diagnosis is not "Yes" or "No"
+  ifelse(data1$`Days with NIV` == 0, "No", "Yes"),  # If Use of ARDS is 0, set Diagnosis to "No", else "Yes"
+  data1$`Use of NIV`  # Keep the existing value if ARDS Diagnosis is already "Yes" or "No"
+)
+
+# Create the clinical groups
+# Example: Assign groups based on a column (e.g., "age")
+# Add clinical_class column based on conditions
+data1 <- data1 %>%
+  mutate(clinical_class = case_when(
+    `Use of NIV` == "No" & `Use of AMV` == "No" & `ARDS Diagnosis` == "No" ~ "G1",
+    `Use of NIV` == "Yes" & `Use of AMV` == "No" & `ARDS Diagnosis` == "Yes" ~ "G3",
+    `Use of AMV` == "Yes" & `ARDS Diagnosis` == "Yes" ~ "G4",
+    TRUE ~ "G2"  # Default case for unmatched rows
+  ))
+
+# Save processed data
+write.csv(data1, "./data/processed_data/Table_1_COVID-19_processed.csv", row.names = FALSE)
+```
+
+This dataset contains clinical and cytokine data from 199 hospitalized COVID-19 patients with 19 columns. 
+
 ```{r}
+# --- Reproduce the Figure ---
+
+#### Plot 1: Age Histogram (Top-Left)
+data1$Age <- as.numeric(data1$Age)
+age_histogram <- hist(data1$Age,
+         breaks = seq(20, 100, by = 10),
+         col = "#e0eeee",
+         border = "black",
+         main = "Age",
+         xlab = "Age (years)",
+         ylab = "Frequency (n)",
+         ylim = c(0, 50),
+         axes = TRUE)
+
+#### Plot 2: Clinical Classification Table (Top-Right)
+# Create the table with 4 columns and 4 rows
+table_1B <- data.frame(matrix(ncol = 4, nrow = 4))
+
+# Assign the column names to the table
+colnames(table_1B) <- c("Clinical\nclassification", "NIV", "AMV", "ARDS")
+
+# Set the corresponding values
+table_1B[1,] <- c("G1", "-", "-", "-")
+table_1B[2,] <- c("G2", "-/+", "+/-", "-")
+table_1B[3,] <- c("G3", "+", "-", "+")
+table_1B[4,] <- c("G4", "-/+", "+", "+")
+
+# Create table with improved formatting
+table_1B <- tableGrob(table_1B, 
+                     rows = NULL,
+                     theme = ttheme_default(
+                         core = list(fg_params=list(cex = 0.8)),
+                         colhead = list(fg_params=list(cex = 0.8))))
+grid::grid.newpage()  # Start a new plotting page
+grid::grid.draw(table_1B)  # Draw the table
+grid::grid.text("Definition of the clinical classification", y = 0.95, gp = gpar(fontsize = 14, fontface = "bold"))
+
+#### Plot 3: Clinical class barplot (Bottom-Left)
+clinical_class_plot <-mids <- barplot(table(data1$clinical_class),
+                    col = c("#8dd3c8", "#feffb3", "#bebbda", "#fb8071"),
+                    main = "Clinical class",
+                    xlab = "Clinical classification",
+                    ylab = "Frequency (n)",
+                    ylim = c(0, 90))  
+    
+    text(x = mids, 
+         y = table(data1$clinical_class) + 5, 
+         labels = table(data1$clinical_class), 
+         cex = 1.2)
+
+#### Plot 4: Vital Status barplot (Bottom-Right)
+death_plot <-mids <- barplot(table(data1$Death),
+                    col = c("#8dd3c8", "#feffb3"),
+                    main = "Vital Status",
+                    xlab = "Death",
+                    ylab = "Frequency (n)",
+                    ylim = c(0, max(table(data1$Death)) + 40))  
+    
+    text(x = mids,
+         y = table(data1$Death) + 10,
+         labels = table(data1$Death),
+         cex = 1.2)
+    
+### We tried to put the plots together using these and transforming the rbase plots to ggplots (with as.ggplot function), but it didn't work
+    
+# wrap_elements(panel = age_histogram, clip = FALSE) + 
+#   table_1B +
+#   wrap_elements(panel = clinical_class_plot, clip = FALSE) +
+#   wrap_elements(panel = death_plot, clip = FALSE) + 
+#   plot_annotation(tag_levels = 'A') # Tag plots
 
 ```
 
 
 ## Reproduce Figure 2 from the publication
-but instead of representing the clusters in the annotation, represent the groups (G1 to G4)
+*but instead of representing the clusters in the annotation, represent the groups (G1 to G4)*
+
+```{r, warning=FALSE, message=FALSE}
+
+# Data import and initial processing 
+file2 <- "./data/raw_data/Table_2_COVID-19.XLSX"
+data2 <- read_excel(file2)
+
+# Clean column headers 
+colnames(data2)[-1] <- data2[1, -1]  # Replace all but the first column
+data2 <- data2[-1, ]                # Remove the first row
+
+# Fill missing values in ID column
+data2 <- data2 %>%
+  fill(ID, .direction = "down")
+
+# Replace "NI" with NA 
+data2[data2 == "NI"] <- NA
+
+# Remove unnecessary columns 
+data2 <- data2[ ,-2] #Remove Day column
+data2 <- data2[, -((ncol(data2)-12):ncol(data2))]
+
+# Convert columns to numeric 
+data2 <- data2 %>%
+  mutate(across(-ID, ~ as.numeric(.), .names = "{col}"))
+
+# Process duplicated IDs  
+data2_processed <- data2 %>%
+  group_by(ID) %>%
+  summarise(across(everything(), ~ mean(.x, na.rm = TRUE))) %>%
+  mutate(across(-ID, ~ round(., 4)))
+
+# Replace NaN with NA
+data2_processed[is.nan(data2_processed)] <- NA
+
+# View missing values 
+vis_miss(data2_processed)
+
+# Impute missing values 
+imputation <- mice(data2_processed, method = "pmm", m = 5)
+data2_processed <- complete(imputation)
+
+# Check there are any missing values
+vis_miss(data2_processed)
+
+# Fix ID mistakes 
+data2_processed$ID <- gsub("COAG-HSDJ-", "COAG-HSJD-", data2_processed$ID)
+
+# Merge with clinical classes 
+data2_processed <- merge(data2_processed, data1[, c("ID", "clinical_class")], by = "ID", all.x = TRUE)
+
+# Save processed data
+write.csv(data2_processed, "./data/processed_data/Table_2_COVID-19_processed.csv", row.names = FALSE)
+```
+
+To reproduce the Figure 2 of the publication, first we processed the data. Once processed, the data contains 194 COVID-19 patients with 22 variables related with the disease. 
+As we can see in the plots, we had missing values in the column of IL-6. But, then the imputation was successful. 
 
 ```{r}
+# ---- Reproduce Heatmap Figure ---
+
+# Select the cytokines and convert to numeric
+cytokines <- data2_processed[, c("IL-1β", "IL-6",  "IL-10", "IFN-ɑ", "TNF-ɑ", "IL-8", "G-CSF", "IFN-γ", "CCL3", "CXCL10", "CCL2", "IL-38")]
+cytokines <- as.data.frame(lapply(cytokines, as.numeric))
+
+# Process row annotations 
+row_ann <- data2_processed$clinical_class
+names(row_ann) <- data2_processed$ID
+
+# Remove rows with missing annotations 
+valid_rows <- !is.na(row_ann)
+cytokines_clean <- cytokines[valid_rows, ]
+row_ann_clean <- row_ann[valid_rows]
+
+#Normalize data (0-100 scale)
+cytokines_clean <- as.data.frame(lapply(cytokines_clean, function(x) {
+  x <- x / max(x, na.rm = TRUE) * 100
+}))
+
+#Create annotation dataframe
+ann_df <- data.frame(ClinicalClass = row_ann_clean)
+rownames(cytokines_clean) <- rownames(ann_df)
+
+# Prepare matrix for heatmap
+cytokines_clean <- t(cytokines_clean)
+ann_df_order <- ann_df[order(ann_df$ClinicalClass), , drop = FALSE]
+cytokines_clean_order <- cytokines_clean[, rownames(ann_df_order)]
+
+#Fix cytokine names 
+rownames(cytokines_clean_order) <- gsub("\\.", "-", rownames(cytokines_clean_order))
+
+#Define annotation colors 
+group_colors <- list(ClinicalClass = c(
+  "G1" = "#0fbc40",
+  "G2" = "#629cff",
+  "G3" = "#f87772",
+  "G4" = "#cd0bbc"
+))
+
+#Create top annotation
+top_anno <- HeatmapAnnotation(
+  ClinicalClass = ann_df_order$ClinicalClass, 
+  col = group_colors,
+  show_annotation_name = FALSE, 
+  annotation_legend_param = list(
+    ClinicalClass = list(
+      title = "Clinical class", 
+      at = c("G1", "G2", "G3", "G4")
+    )
+))
+
+# We tried to have the same order as in the original Figure, but it didn't work. 
+# cyt_order <- c("IL.6", "CXCL10", "IL.38", "IL.8", "IFN.ɑ", "IL.10", "TNF.ɑ", "CCL2", "CCL3", "IFN.γ", "IL.1β", "G.CSF")
+# cytokines_clean_order <- cytokines_clean_order[cyt_order, ]
+
+#Create heatmap
+heatmap1 <- Heatmap(cytokines_clean_order, 
+        name = "Relative Expression", 
+        col = colorRamp2(c(0, 50, 100), colors = c("#fdeee1", "#fc9a55", "#8c2c06")), 
+        cluster_rows = TRUE, 
+        cluster_columns = TRUE, 
+        top_annotation = top_anno, 
+        show_row_names = TRUE, 
+        show_column_names = FALSE, 
+        row_names_side = "right",
+        column_title = "Patients", 
+        column_title_side = "bottom", 
+        heatmap_legend_param = list(
+           title = "Relative Expression (%)", 
+           at = c(0, 50, 100), 
+           labels = c("0.00", "50.0½", "100.0%"),
+           color_bar = "discrete"
+           )
+)
+
+# Draw final heatmap
+draw(heatmap1, 
+  heatmap_legend_side = "left", 
+  annotation_legend_side = "left")
 
 ```
+
+
+
 
 ## Improve figure 2 of the publication
-Add a second annotation with information of deathm and a third one with information of gender
+*Add a second annotation with information of deaths and a third one with information of gender*
 
 ```{r}
 
+# Merge the data with metadata
+data2_processed_meta <- merge(data2_processed, data1[, c("ID", "Gender", "Death")], by = "ID", all.x = TRUE)
+
+# Check for missing data
+vis_miss(data2_processed_meta)
+
+# Filter out rows with NA in key columns
+data2_processed_meta <- data2_processed_meta %>%
+  filter(!is.na(Gender) & !is.na(Death) & !is.na(clinical_class))
+
+# Verify no missing data remains
+vis_miss(data2_processed_meta)
+
+# Remove the specific row where Gender is 72 
+data2_processed_meta <- data2_processed_meta[data2_processed_meta$Gender %in% c("M", "F"), ]
+
+# Save merged data with processed data plus metadata 
+write.csv(data2_processed_meta, "./data/processed_data/Table_2_COVID-19_processed_with_metadata.csv", row.names = FALSE)
 ```
+
+
+To improve the Figure 2 of the publication, after merging the processed dataset 2 with the metadata, we checked the missing values and imputed them. 
+
+```{r}
+# Select cytokine columns and convert to numeric
+cytokines2 <- data2_processed_meta[, c("IL-1β", "IL-6", "IL-10", "IFN-ɑ", 
+                                      "TNF-ɑ", "IL-8", "G-CSF", "IFN-γ", 
+                                      "CCL3", "CXCL10", "CCL2", "IL-38")]
+cytokines2 <- as.data.frame(lapply(cytokines2, as.numeric))
+
+# Create matrix for heatmap
+cytokine2_matrix <- as.matrix(cytokines2)
+rownames(cytokine2_matrix) <- data2_processed_meta$ID
+
+# Normalize the data (0-100 scale)
+cytokine2_matrix_norm <- apply(cytokine2_matrix, 2, function(x) {
+  (x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE)) * 100
+})
+
+# Create a new ordered factor for clinical_class to ensure specific order
+data2_processed_meta$clinical_class <- factor(data2_processed_meta$clinical_class, levels = c("G1", "G2", "G3", "G4"))
+
+# Create column annotation 
+col_anno2 <- HeatmapAnnotation(
+  Gender = factor(data2_processed_meta$Gender), 
+  Death = factor(data2_processed_meta$Death), 
+  ClinicalClass = factor(data2_processed_meta$clinical_class),
+  col = list(
+    Gender = c("F" = "pink", "M" = "skyblue"), 
+    Death = c( "No" = "white", "Yes" = "black"), 
+    ClinicalClass = c(
+    "G1" = viridis(4)[1],
+    "G2" = viridis(4)[2],
+    "G3" = viridis(4)[3],
+    "G4" = viridis(4)[4]
+  )), 
+  show_annotation_name = FALSE, 
+  annotation_legend_param = list(
+    ClinicalClass = list(title = "Clinical class")
+  )
+)
+
+# Create and display the heatmap
+heatmap2 <- Heatmap(
+    t(cytokine2_matrix_norm),
+    name = "Expression (%)",
+    col = colorRamp2(c(0, 50, 100), c("#1F449C", "white", "#F05039")),
+    top_annotation = col_anno2, 
+    show_row_names = TRUE,
+    show_column_names = FALSE,
+    cluster_rows = TRUE,
+    cluster_columns = FALSE,
+    column_title = NULL, 
+    column_order = order(
+      data2_processed_meta$clinical_class, 
+      data2_processed_meta$Gender, 
+      data2_processed_meta$Death
+    ),
+    heatmap_legend_param = list(
+        at = c(0, 50, 100),
+        labels = c("0", "50", "100"), 
+        title = "Expression (%)"
+    )
+)
+
+# Draw the heatmap
+draw(heatmap2)
+```
+
+
+The heatmap displays cytokine expression levels across different samples, using a color-blind-friendly palette. We can see a clear grouping based on clinical class (G1-G4). The top annotations also represent gender and survival status. 
 
 
 # session info {.unnumbered}
